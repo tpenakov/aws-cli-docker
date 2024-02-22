@@ -1,0 +1,145 @@
+####
+# If you want to pull the latest node image, run:
+#
+# docker run --rm -it --network host --pull=always node:current npm -v
+#
+# Then, build the image with:
+#
+# docker build -f Dockerfile.aws-cli-cdk-npm-docker -t tp/aws-cli-cdk-npm-docker .
+#
+# Then run the container using:
+#
+# docker run -i --rm tp/aws-cli-cdk-npm-docker
+#
+###
+FROM python:3.10-alpine3.17 as aws_builder
+
+ARG AWS_CLI_VERSION=2.11.11
+RUN apk add --no-cache git unzip groff build-base libffi-dev cmake
+RUN git clone --single-branch --depth 1 -b ${AWS_CLI_VERSION} https://github.com/aws/aws-cli.git
+
+WORKDIR aws-cli
+RUN ./configure --with-install-type=portable-exe --with-download-deps
+RUN make
+RUN make install
+
+# reduce image size: remove autocomplete and examples
+RUN rm -rf \
+    /usr/local/lib/aws-cli/aws_completer \
+    /usr/local/lib/aws-cli/awscli/data/ac.index \
+    /usr/local/lib/aws-cli/awscli/examples
+RUN find /usr/local/lib/aws-cli/awscli/data -name completions-1*.json -delete
+RUN find /usr/local/lib/aws-cli/awscli/botocore/data -name examples-1.json -delete
+RUN (cd /usr/local/lib/aws-cli; for a in *.so*; do test -f /lib/$a && rm $a; done)
+
+FROM docker:23.0.6-dind-alpine3.17
+RUN echo '123460'
+
+# install curl
+RUN apk update && apk upgrade && apk add libssh2 libssh2-dev libssh2-static \
+        autoconf automake build-base                    \
+        groff openssl curl-dev                          \
+        python3 python3-dev                             \
+        libtool curl stunnel perl                       \
+        nghttp2 brotli brotli-dev                      \
+        bash git \
+        && mkdir /src
+
+#install node
+ENV NODE_VERSION 20.2.0
+
+RUN addgroup -g 1000 node \
+    && adduser -u 1000 -G node -s /bin/sh -D node \
+    && apk add --no-cache \
+        libstdc++ \
+    && apk add --no-cache --virtual .build-deps \
+        curl \
+    && ARCH= && alpineArch="$(apk --print-arch)" \
+      && case "${alpineArch##*-}" in \
+        x86_64) \
+          ARCH='x64' \
+          CHECKSUM="598adbb518f3fb77b648dbfb5375d54ba8aa99378415993e2252e03d31259b84" \
+          ;; \
+        *) ;; \
+      esac \
+  && if [ -n "${CHECKSUM}" ]; then \
+    set -eu; \
+    curl -fsSLO --compressed "https://unofficial-builds.nodejs.org/download/release/v$NODE_VERSION/node-v$NODE_VERSION-linux-$ARCH-musl.tar.xz"; \
+    echo "$CHECKSUM  node-v$NODE_VERSION-linux-$ARCH-musl.tar.xz" | sha256sum -c - \
+      && tar -xJf "node-v$NODE_VERSION-linux-$ARCH-musl.tar.xz" -C /usr/local --strip-components=1 --no-same-owner \
+      && ln -s /usr/local/bin/node /usr/local/bin/nodejs; \
+  else \
+    echo "Building from source" \
+    # backup build
+    && apk add --no-cache --virtual .build-deps-full \
+        binutils-gold \
+        g++ \
+        gcc \
+        gnupg \
+        libgcc \
+        linux-headers \
+        make \
+        python3 \
+    # gpg keys listed at https://github.com/nodejs/node#release-keys
+    && for key in \
+      4ED778F539E3634C779C87C6D7062848A1AB005C \
+      141F07595B7B3FFE74309A937405533BE57C7D57 \
+      74F12602B6F1C4E913FAA37AD3A89613643B6201 \
+      DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7 \
+      61FC681DFB92A079F1685E77973F295594EC4689 \
+      8FCCA13FEF1D0C2E91008E09770F7A9A5AE15600 \
+      C4F0DFFF4E8C1A8236409D08E73BC641CC11F4C8 \
+      890C08DB8579162FEE0DF9DB8BEAB4DFCF555EF4 \
+      C82FA3AE1CBEDC6BE46B9360C43CEC45C17AB93C \
+      108F52B48DB57BB0CC439B2997B01419BD92F80A \
+    ; do \
+      gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys "$key" || \
+      gpg --batch --keyserver keyserver.ubuntu.com --recv-keys "$key" ; \
+    done \
+    && curl -fsSLO --compressed "https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION.tar.xz" \
+    && curl -fsSLO --compressed "https://nodejs.org/dist/v$NODE_VERSION/SHASUMS256.txt.asc" \
+    && gpg --batch --decrypt --output SHASUMS256.txt SHASUMS256.txt.asc \
+    && grep " node-v$NODE_VERSION.tar.xz\$" SHASUMS256.txt | sha256sum -c - \
+    && tar -xf "node-v$NODE_VERSION.tar.xz" \
+    && cd "node-v$NODE_VERSION" \
+    && ./configure \
+    && make -j$(getconf _NPROCESSORS_ONLN) V= \
+    && make install \
+    && apk del .build-deps-full \
+    && cd .. \
+    && rm -Rf "node-v$NODE_VERSION" \
+    && rm "node-v$NODE_VERSION.tar.xz" SHASUMS256.txt.asc SHASUMS256.txt; \
+  fi \
+  && rm -f "node-v$NODE_VERSION-linux-$ARCH-musl.tar.xz" \
+  && apk del .build-deps \
+  # smoke tests
+  && node --version \
+  && npm --version
+
+ENV YARN_VERSION 1.22.19
+
+RUN apk add --no-cache --virtual .build-deps-yarn curl gnupg tar \
+  && for key in \
+    6A010C5166006599AA17F08146C2130DFD2497F5 \
+  ; do \
+    gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys "$key" || \
+    gpg --batch --keyserver keyserver.ubuntu.com --recv-keys "$key" ; \
+  done \
+  && curl -fsSLO --compressed "https://yarnpkg.com/downloads/$YARN_VERSION/yarn-v$YARN_VERSION.tar.gz" \
+  && curl -fsSLO --compressed "https://yarnpkg.com/downloads/$YARN_VERSION/yarn-v$YARN_VERSION.tar.gz.asc" \
+  && gpg --batch --verify yarn-v$YARN_VERSION.tar.gz.asc yarn-v$YARN_VERSION.tar.gz \
+  && mkdir -p /opt \
+  && tar -xzf yarn-v$YARN_VERSION.tar.gz -C /opt/ \
+  && ln -s /opt/yarn-v$YARN_VERSION/bin/yarn /usr/local/bin/yarn \
+  && ln -s /opt/yarn-v$YARN_VERSION/bin/yarnpkg /usr/local/bin/yarnpkg \
+  && rm yarn-v$YARN_VERSION.tar.gz.asc yarn-v$YARN_VERSION.tar.gz \
+  && apk del .build-deps-yarn \
+  # smoke test
+  && yarn --version
+
+
+RUN docker-entrypoint.sh npm install -g tsc aws-cdk
+
+COPY --from=aws_builder /usr/local/lib/aws-cli/ /usr/local/lib/aws-cli/
+RUN ln -s /usr/local/lib/aws-cli/aws /usr/local/bin/aws
+
